@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+Quantum Simplex Sharding – Reference Implementation
+Demonstrates sharding, cross‑shard transactions, and state pruning using H²+Q²=1.
+"""
+
+import hashlib
+import math
+import json
+import random
+from typing import List, Dict, Tuple, Optional
+
+# ============================================================================
+# 1. Geometric Primitives
+# ============================================================================
+
+class QuantumTriangle:
+    def __init__(self, alpha: float, beta: float, phase: float):
+        s = alpha + beta
+        if s > 0:
+            alpha /= s
+            beta /= s
+        else:
+            alpha = beta = 0.5
+        self.alpha = alpha
+        self.beta = beta
+        self.phase = phase % (2 * math.pi)
+
+    @property
+    def H(self) -> float:
+        return math.sqrt(1 - 4 * self.alpha * self.beta * math.sin(self.phase/2)**2)
+
+    @property
+    def Q(self) -> float:
+        return 2 * math.sqrt(self.alpha * self.beta) * abs(math.sin(self.phase/2))
+
+    @property
+    def area(self) -> float:
+        return 0.5 * self.alpha * self.beta * abs(math.sin(self.phase))
+
+    def to_dict(self) -> dict:
+        return {'alpha': self.alpha, 'beta': self.beta, 'phase': self.phase}
+
+    @classmethod
+    def from_hash(cls, data: bytes) -> 'QuantumTriangle':
+        h = hashlib.sha256(data).digest()
+        alpha = int.from_bytes(h[:8], 'big') / 2**64
+        beta  = int.from_bytes(h[8:16], 'big') / 2**64
+        phase = (int.from_bytes(h[16:24], 'big') / 2**64) * 2 * math.pi
+        return cls(alpha, beta, phase)
+
+
+class Simplex:
+    def __init__(self, vertices: List[QuantumTriangle]):
+        self.vertices = vertices
+        self.d = len(vertices)
+
+    @property
+    def volume(self) -> float:
+        if self.d < 2:
+            return 0.0
+        prod = 1.0
+        for v in self.vertices:
+            prod *= v.alpha
+        fact = math.factorial(self.d - 1)
+        return prod / fact
+
+    @property
+    def determinant(self) -> int:
+        return self.d ** (self.d - 1)
+
+    def to_dict(self) -> dict:
+        return {'d': self.d, 'vertices': [v.to_dict() for v in self.vertices]}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'Simplex':
+        vertices = [QuantumTriangle.from_dict(v) for v in d['vertices']]
+        return cls(vertices)
+
+
+# ============================================================================
+# 2. Shard Representation
+# ============================================================================
+
+class SimplexShard:
+    def __init__(self, shard_id: int, dimension: int = 3):
+        self.id = shard_id
+        self.dimension = dimension
+        self.vertices = []          # list of QuantumTriangle (accounts)
+        self._simplex = None
+
+    def add_account(self, account: QuantumTriangle):
+        if len(self.vertices) < self.dimension:
+            self.vertices.append(account)
+        else:
+            raise ValueError("Shard already at max capacity")
+        self._simplex = None
+
+    @property
+    def simplex(self) -> Simplex:
+        if self._simplex is None:
+            # Pad with dummy triangles if necessary
+            vertices = self.vertices[:]
+            while len(vertices) < self.dimension:
+                vertices.append(QuantumTriangle(0.5, 0.5, 0))
+            self._simplex = Simplex(vertices)
+        return self._simplex
+
+    @property
+    def volume(self) -> float:
+        return self.simplex.volume
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'dimension': self.dimension,
+            'vertices': [v.to_dict() for v in self.vertices]
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'SimplexShard':
+        shard = cls(d['id'], d['dimension'])
+        shard.vertices = [QuantumTriangle.from_dict(v) for v in d['vertices']]
+        shard._simplex = None
+        return shard
+
+
+# ============================================================================
+# 3. Shard Manager (State)
+# ============================================================================
+
+class ShardManager:
+    def __init__(self, prune_threshold: float = 0.01):
+        self.shards: Dict[int, SimplexShard] = {}
+        self.prune_threshold = prune_threshold
+        self.next_shard_id = 0
+
+    def create_shard(self, dimension: int = 3) -> int:
+        shard_id = self.next_shard_id
+        self.shards[shard_id] = SimplexShard(shard_id, dimension)
+        self.next_shard_id += 1
+        return shard_id
+
+    def add_account_to_shard(self, shard_id: int, account: QuantumTriangle):
+        shard = self.shards[shard_id]
+        shard.add_account(account)
+
+    def cross_shard_transfer(self,
+                             from_shard_id: int,
+                             from_vertex_idx: int,
+                             to_shard_id: int,
+                             to_vertex_idx: int,
+                             amount: float) -> bool:
+        """
+        Transfer `amount` from vertex `from_vertex_idx` in shard A
+        to vertex `to_vertex_idx` in shard B.
+        Valid if total volume of both shards is conserved.
+        """
+        shardA = self.shards[from_shard_id]
+        shardB = self.shards[to_shard_id]
+
+        # Original volumes
+        volA_before = shardA.volume
+        volB_before = shardB.volume
+
+        # Perform transfer (simplified: adjust the triangles)
+        # In practice, we would modify the actual account balances.
+        # Here we just adjust the alpha of the vertices.
+        accountA = shardA.vertices[from_vertex_idx]
+        accountB = shardB.vertices[to_vertex_idx]
+
+        # Check if enough balance
+        if accountA.alpha < amount:
+            return False
+
+        accountA.alpha -= amount
+        accountB.alpha += amount
+
+        # Recompute volumes
+        shardA._simplex = None
+        shardB._simplex = None
+        volA_after = shardA.volume
+        volB_after = shardB.volume
+
+        # Volume conservation
+        if abs((volA_before + volB_before) - (volA_after + volB_after)) > 1e-6:
+            # Rollback
+            accountA.alpha += amount
+            accountB.alpha -= amount
+            return False
+        return True
+
+    def prune_shards(self):
+        """Merge shards with volume below threshold into a new parent shard."""
+        to_merge = [sid for sid, s in self.shards.items() if s.volume < self.prune_threshold]
+        if not to_merge:
+            return
+
+        # Create a parent shard of higher dimension
+        parent_dim = max(self.shards[sid].dimension for sid in to_merge) + 1
+        parent_id = self.create_shard(parent_dim)
+
+        # Add the volumes as vertices (representing the child shards)
+        for sid in to_merge:
+            child_shard = self.shards[sid]
+            # Create a triangle from the shard's volume and a dummy phase
+            triangle = QuantumTriangle(child_shard.volume, 1 - child_shard.volume, 0)
+            self.add_account_to_shard(parent_id, triangle)
+
+        # Remove merged shards
+        for sid in to_merge:
+            del self.shards[sid]
+
+    def to_dict(self) -> dict:
+        return {
+            'next_id': self.next_shard_id,
+            'shards': {sid: s.to_dict() for sid, s in self.shards.items()}
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ShardManager':
+        mgr = cls()
+        mgr.next_shard_id = d['next_id']
+        mgr.shards = {int(k): SimplexShard.from_dict(v) for k, v in d['shards'].items()}
+        return mgr
+
+
+# ============================================================================
+# 4. Example Usage & Test
+# ============================================================================
+
+def test_geometric_sharding():
+    mgr = ShardManager(prune_threshold=0.05)
+
+    # Create two shards of dimension 3 (triangle shards)
+    shard1_id = mgr.create_shard(3)
+    shard2_id = mgr.create_shard(3)
+
+    # Create some accounts as triangles (each account has α balance)
+    acc1 = QuantumTriangle(0.8, 0.2, 0.1)
+    acc2 = QuantumTriangle(0.3, 0.7, 0.5)
+    acc3 = QuantumTriangle(0.6, 0.4, 0.2)
+
+    mgr.add_account_to_shard(shard1_id, acc1)
+    mgr.add_account_to_shard(shard1_id, acc2)
+    mgr.add_account_to_shard(shard2_id, acc3)
+
+    print(f"Shard 1 volume: {mgr.shards[shard1_id].volume:.4f}")
+    print(f"Shard 2 volume: {mgr.shards[shard2_id].volume:.4f}")
+
+    # Cross-shard transfer from acc1 (shard1) to acc3 (shard2)
+    success = mgr.cross_shard_transfer(shard1_id, 0, shard2_id, 0, 0.1)
+    print(f"Transfer success: {success}")
+
+    print(f"After transfer – Shard 1 volume: {mgr.shards[shard1_id].volume:.4f}")
+    print(f"After transfer – Shard 2 volume: {mgr.shards[shard2_id].volume:.4f}")
+
+    # Prune shards if they become too small
+    mgr.prune_shards()
+    print(f"Shards after pruning: {list(mgr.shards.keys())}")
+
+if __name__ == '__main__':
+    test_geometric_sharding()
